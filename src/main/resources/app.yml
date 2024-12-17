@@ -1,0 +1,29 @@
+# 控制台输出的版权文字
+copyright: QAIU
+
+# 代理服务
+proxy-server:
+  randUserPwd: false
+  type: http # 支持http/socks4/socks5
+  port: 8899
+  # 线上建议配置用户名密码
+#  username:
+#  password:
+
+# 前置代理
+#proxy-pre:
+#  host: 127.0.0.1
+#  port: 7890
+#  type: http # 支持http/socks4/socks5
+#  username:
+#  password:
+
+# vertx核心线程配置(一般无需改的), 为0表示eventLoopPoolSize将会采用默认配置(CPU核心*2) workerPoolSize将会采用默认20
+vertx:
+  eventLoopPoolSize: 0
+  workerPoolSize: 0
+
+# vertx-service配置(一般无需改的)
+custom:
+  # 异步服务线程数
+  asyncServiceInstances: 4
