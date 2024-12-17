@@ -131,20 +131,23 @@ public class HttpProxyVerticle extends AbstractVerticle {
     private void handleClientRequest(HttpServerRequest clientRequest) {
         // 打印来源ip和访问目标URI
         LOGGER.debug("source: {}, target: {}", clientRequest.remoteAddress().toString(), clientRequest.uri());
-        String s = clientRequest.headers().get("Proxy-Authorization");
-        if (s == null) {
-            clientRequest.response().setStatusCode(403).end();
-            return;
-        }
-        String[] split = new String(Base64.getDecoder().decode(s.replace("Basic ", ""))).split(":");
-        if (split.length > 1) {
-            // TODO
-            String username = proxyServerConf.getString("username");
-            String password = proxyServerConf.getString("password");
-            if (!split[0].equals(username) || !split[1].equals(password)) {
-                LOGGER.info("-----auth failed------\nusername: {}\npassword: {}", username, password);
+        if (proxyServerConf.containsKey("username") &&
+                StringUtils.isNotBlank(proxyServerConf.getString("username"))) {
+            String s = clientRequest.headers().get("Proxy-Authorization");
+            if (s == null) {
                 clientRequest.response().setStatusCode(403).end();
                 return;
+            }
+            String[] split = new String(Base64.getDecoder().decode(s.replace("Basic ", ""))).split(":");
+            if (split.length > 1) {
+                // TODO
+                String username = proxyServerConf.getString("username");
+                String password = proxyServerConf.getString("password");
+                if (!split[0].equals(username) || !split[1].equals(password)) {
+                    LOGGER.info("-----auth failed------\nusername: {}\npassword: {}", username, password);
+                    clientRequest.response().setStatusCode(403).end();
+                    return;
+                }
             }
         }
 
