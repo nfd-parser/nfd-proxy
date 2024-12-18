@@ -11,8 +11,10 @@ java -jar target/nfd-proxy.jar
 ```
 
 # 部署运行:
+1. 将src/main/resources/app.yml和target/nfd-proxy.jar上传至服务器, 这两个文件放到同一个目录下.
+2. 运行jar包
 ```bash
-nohup java -jar target/nfd-proxy.jar > out-nfd-proxy.log 2>&1 &
+nohup java -jar nfd-proxy.jar > out-nfd-proxy.log 2>&1 &
 ```
 
 # 如何使用: 
