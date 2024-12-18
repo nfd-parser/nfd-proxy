@@ -232,6 +232,9 @@ public class HttpProxyVerticle extends AbstractVerticle {
         if (httpClient != null) {
             httpClient.close();
         }
+        if (netClient != null) {
+            netClient.close();
+        }
     }
 
 }
