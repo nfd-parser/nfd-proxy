@@ -23,7 +23,7 @@ app.yml:
 ```yml
 proxy-server:
   randUserPwd: false #是否随机生成用户名密码, 启用此功能会更安全, 防止代理被滥用
-  type: http # 支持http/socks4/socks5
+  type: http # 目前仅支持http隧道
   port: 8899
   # 线上建议配置用户名密码
   username: 您的用户名
