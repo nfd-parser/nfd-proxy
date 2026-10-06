@@ -136,6 +136,12 @@ public final class Deploy {
                     jsonObject.getString("port"),
                     jsonObject.getString("username"),
                     jsonObject.getString("password"));
+            JsonObject dnodeServer = globalConfig.getJsonObject("dnode-server");
+            JsonObject dnodeClient = globalConfig.getJsonObject("dnode-client");
+            boolean ds = dnodeServer != null && Boolean.TRUE.equals(dnodeServer.getBoolean("enabled"));
+            boolean dc = dnodeClient != null && Boolean.TRUE.equals(dnodeClient.getBoolean("enabled"));
+            LOGGER.info("dnode-server: {}", ds ? ("on port " + dnodeServer.getInteger("port", 9000)) : "off");
+            LOGGER.info("dnode-client: {}", dc ? dnodeClient.getString("server") : "off");
             LOGGER.info("==============server info================");
 
             var future3 = vertx.deployVerticle(HttpProxyVerticle.class, getWorkDeploymentOptions("proxy"));

@@ -31,6 +31,9 @@ target/
 sdkTest.log
 
 
+# dnode client auto-generated id
+node_config.json
+
 #some local files
 */.DS_Store
 .DS_Store
@@ -40,3 +43,7 @@ unused.txt
 /web-service/src/main/generated/
 /db
 /webroot/nfd-front/
+/.tmp/
+
+# 123网盘 token, 仅本地调试用, 线上走 EO 环境变量与密钥
+/src/main/resources/edge/token

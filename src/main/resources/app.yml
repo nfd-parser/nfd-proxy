@@ -18,6 +18,26 @@ proxy-server:
 #  username:
 #  password:
 
+# 分布式节点控制面（默认关闭）。开启后节点可通过 ws://host:port/ws/node 接入，
+# 代理 CONNECT/HTTP 会按 同城→同省→默认节点→最低负载 分发。
+# 无可用节点时默认回退本机直连，不影响原有代理行为。
+dnode-server:
+  enabled: false
+  port: 9000
+  path: /ws/node
+  secret: ""
+  admin-token: ""
+  fallback-direct: true
+
+# 作为出口节点接入远端 DNode 控制面（默认关闭）
+dnode-client:
+  enabled: true
+  server: wss://dnode.qaiu.top/ws/node
+  secret: ""
+  node-id: ""
+  default-node: false
+  ssl-insecure: false
+
 # vertx核心线程配置(一般无需改的), 为0表示eventLoopPoolSize将会采用默认配置(CPU核心*2) workerPoolSize将会采用默认20
 vertx:
   eventLoopPoolSize: 0
