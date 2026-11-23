@@ -6,6 +6,14 @@ proxy-server:
   randUserPwd: false
   type: http # 支持http/socks4/socks5
   port: 8899
+  # 监听地址，默认所有网卡；只给本机用时改成 127.0.0.1
+  host: 0.0.0.0
+  # 连接无读写超过该秒数即关闭（CONNECT 隧道与上游连接同样适用），0 为不限制
+  idleTimeout: 300
+  # 连接上游超时（毫秒）
+  connectTimeout: 15000
+  # 同时转发的 CONNECT 隧道 + HTTP 请求上限，超出返回 503
+  maxConnections: 1024
   # 线上建议配置用户名密码
 #  username:
 #  password:
@@ -31,7 +39,7 @@ dnode-server:
 
 # 作为出口节点接入远端 DNode 控制面（默认关闭）
 dnode-client:
-  enabled: true
+  enabled: false
   server: wss://dnode.qaiu.top/ws/node
   secret: ""
   node-id: ""
