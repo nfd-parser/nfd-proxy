@@ -41,23 +41,33 @@ java -jar nfd-proxy.jar app-dev
 
 ```yml
 proxy-server:
-  randUserPwd: false   # true 时启动生成随机用户名密码，日志会打印
+  randUserPwd: false   # true 时启动生成随机用户名密码，只打印到标准输出，不写日志文件
   type: http           # 目前对外代理为 HTTP 隧道
+  host: 0.0.0.0        # 只给本机用时可改为 127.0.0.1
   port: 8899
-  username: 您的用户名   # 线上建议配置
+  username: 您的用户名   # 线上必须配置；留空即为开放代理
   password: 您的密码
+  idleTimeout: 300     # 秒，连接双向都无数据超过该时长才关闭，持续传输不受影响；0 不限制
+  connectTimeout: 15000  # 毫秒，连上游的超时
+  maxConnections: 1024 # 同时处理的连接数上限，超出返回 503
 ```
 
-启动后日志：
+启动后日志（密码不会出现在日志中）：
 
 ```
 =============server info=================
 port: 8899
 username: xxx
-password: xxx
+password: ******
 dnode-server: off
 dnode-client: off
 ```
+
+大文件转发说明：
+
+- HTTP 转发与 CONNECT 隧道都是流式转发并带背压，内存占用与文件大小无关。
+- 客户端中途断开会立即中止上游请求；上游中途断开会关闭客户端连接，不会把截断的内容当作完整响应/上传交给对端。
+- CONNECT 隧道不支持 TCP 半关闭：任一方向结束（收到 FIN）时整条隧道关闭。HTTPS 上传/下载不依赖半关闭，不受影响。
 
 可选前置代理（本机再走一层上游）：
 
@@ -142,7 +152,7 @@ curl -s -H "Authorization: Bearer 管理口令" http://127.0.0.1:9000/api/admin/
 
 ### 出口节点（`dnode-client`）
 
-把本机当作下游出口，接入远端控制面。`node-id` 为空时会生成并写入工作目录 `node_config.json`（已加入 `.gitignore`）。
+把本机当作下游出口，接入远端控制面。默认配置为 `enabled: false`，需要时手动开启。`node-id` 为空时会生成并写入工作目录 `node_config.json`（已加入 `.gitignore`）。
 
 ```yml
 dnode-client:
