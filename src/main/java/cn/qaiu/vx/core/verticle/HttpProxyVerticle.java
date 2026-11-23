@@ -5,6 +5,9 @@ import cn.qaiu.vx.core.dnode.DNodeServer;
 import cn.qaiu.vx.core.dnode.DNodeTunnel;
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Context;
+import io.vertx.core.Future;
+import io.vertx.core.Promise;
+import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpClient;
 import io.vertx.core.http.HttpClientOptions;
@@ -21,15 +24,20 @@ import io.vertx.core.net.NetClientOptions;
 import io.vertx.core.net.NetSocket;
 import io.vertx.core.net.ProxyOptions;
 import io.vertx.core.net.ProxyType;
+import io.vertx.core.streams.ReadStream;
+import io.vertx.core.streams.WriteStream;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.Base64;
 import java.util.Locale;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static cn.qaiu.vx.core.util.ConfigConstant.GLOBAL_CONFIG;
 import static cn.qaiu.vx.core.util.ConfigConstant.LOCAL;
@@ -45,25 +53,44 @@ public class HttpProxyVerticle extends AbstractVerticle {
             "te", "trailers", "transfer-encoding", "upgrade", "proxy-connection"
     );
 
+    static final int DEFAULT_IDLE_TIMEOUT_SECONDS = 300;
+    static final int DEFAULT_CONNECT_TIMEOUT_MS = 15000;
+    static final int DEFAULT_MAX_CONNECTIONS = 1024;
+
+    /** 所有实例共享：正在转发的 CONNECT 隧道 + HTTP 请求数 */
+    private static final AtomicInteger ACTIVE = new AtomicInteger();
+
     private HttpClient httpClient;
     private NetClient netClient;
 
     private JsonObject proxyPreConf;
     private JsonObject proxyServerConf;
+    private int maxConnections;
+
+    public static int activeConnections() {
+        return ACTIVE.get();
+    }
 
     @Override
-    public void start() {
+    public void start(Promise<Void> startPromise) {
         JsonObject global = (JsonObject) vertx.sharedData().getLocalMap(LOCAL).get(GLOBAL_CONFIG);
         proxyServerConf = global.getJsonObject("proxy-server");
         proxyPreConf = global.getJsonObject("proxy-pre");
         Integer serverPort = proxyServerConf.getInteger("port");
+        int idleTimeout = proxyServerConf.getInteger("idleTimeout", DEFAULT_IDLE_TIMEOUT_SECONDS);
+        int connectTimeout = proxyServerConf.getInteger("connectTimeout", DEFAULT_CONNECT_TIMEOUT_MS);
+        maxConnections = proxyServerConf.getInteger("maxConnections", DEFAULT_MAX_CONNECTIONS);
+        String host = StringUtils.defaultIfBlank(proxyServerConf.getString("host"), "0.0.0.0");
 
         ProxyOptions proxyOptions = buildUpstreamProxy(proxyPreConf);
 
         HttpClientOptions httpClientOptions = new HttpClientOptions()
                 .setMaxPoolSize(64)
+                .setMaxWaitQueueSize(256)
                 .setKeepAlive(true)
-                .setConnectTimeout(15000)
+                .setConnectTimeout(connectTimeout)
+                .setIdleTimeout(idleTimeout)
+                .setTcpKeepAlive(true)
                 .setTcpNoDelay(true)
                 .setTrustAll(true);
         if (proxyOptions != null) {
@@ -72,11 +99,16 @@ public class HttpProxyVerticle extends AbstractVerticle {
         httpClient = vertx.createHttpClient(httpClientOptions);
 
         // 认证走 Proxy-Authorization；明文端口不启用 TLS ClientAuth（与原运行行为一致）
-        HttpServer server = vertx.createHttpServer(new HttpServerOptions().setTcpNoDelay(true));
+        HttpServer server = vertx.createHttpServer(new HttpServerOptions()
+                .setTcpNoDelay(true)
+                .setTcpKeepAlive(true)
+                .setIdleTimeout(idleTimeout));
         server.requestHandler(this::handleClientRequest);
 
         NetClientOptions netClientOptions = new NetClientOptions()
-                .setConnectTimeout(15000)
+                .setConnectTimeout(connectTimeout)
+                .setIdleTimeout(idleTimeout)
+                .setTcpKeepAlive(true)
                 .setTcpNoDelay(true)
                 .setTrustAll(true);
         if (proxyOptions != null) {
@@ -93,13 +125,31 @@ public class HttpProxyVerticle extends AbstractVerticle {
             DNodeClient.get().start(vertx, dnodeClientConf);
         });
 
-        server.listen(serverPort, ar -> {
+        server.listen(serverPort, host, ar -> {
             if (ar.succeeded()) {
-                LOGGER.info("HTTP Proxy server started on port {}", serverPort);
+                LOGGER.info("HTTP Proxy server started on port {}", ar.result().actualPort());
+                startPromise.complete();
             } else {
                 LOGGER.error("Failed to start HTTP Proxy server: {}", ar.cause().toString());
+                startPromise.fail(ar.cause());
             }
         });
+    }
+
+    /**
+     * 占用一个转发名额；超出 maxConnections 时返回 null。返回的 Runnable 可重复调用，只释放一次。
+     */
+    private Runnable acquire() {
+        if (ACTIVE.incrementAndGet() > maxConnections) {
+            ACTIVE.decrementAndGet();
+            return null;
+        }
+        AtomicBoolean released = new AtomicBoolean();
+        return () -> {
+            if (released.compareAndSet(false, true)) {
+                ACTIVE.decrementAndGet();
+            }
+        };
     }
 
     private void handleConnectRequest(HttpServerRequest clientRequest) {
@@ -108,42 +158,53 @@ public class HttpProxyVerticle extends AbstractVerticle {
             clientRequest.response().setStatusCode(400).end("Bad Request: Invalid URI format");
             return;
         }
-        clientRequest.pause();
-        if (routeViaDnode(clientRequest, target, true)) {
+        Runnable release = acquire();
+        if (release == null) {
+            rejectBusy(clientRequest);
             return;
         }
-        directConnect(clientRequest, target);
+        clientRequest.pause();
+        Context ctx = vertx.getOrCreateContext();
+        if (routeViaDnode(clientRequest, target, true, ctx, release)) {
+            return;
+        }
+        directConnect(clientRequest, target, ctx, release);
     }
 
-    private void directConnect(HttpServerRequest clientRequest, HostPort target) {
-        netClient.connect(target.port, target.host, connectionAttempt -> {
+    private void directConnect(HttpServerRequest clientRequest, HostPort target, Context ctx, Runnable release) {
+        // 隧道两端必须在请求所在的同一 event loop 上，否则会重新引入跨线程锁竞争
+        onContext(ctx, () -> netClient.connect(target.port, target.host, connectionAttempt -> {
             if (connectionAttempt.succeeded()) {
                 NetSocket targetSocket = connectionAttempt.result();
                 clientRequest.toNetSocket().onComplete(clientSocketAttempt -> {
                     if (clientSocketAttempt.succeeded()) {
-                        pipeSockets(clientSocketAttempt.result(), targetSocket);
+                        pipeSockets(clientSocketAttempt.result(), targetSocket, release);
                     } else {
                         LOGGER.debug("Failed to upgrade client connection to socket: {}",
                                 clientSocketAttempt.cause().toString());
                         targetSocket.close();
+                        release.run();
                     }
                 });
             } else {
                 LOGGER.debug("Failed to connect to target: {}", connectionAttempt.cause().toString());
+                release.run();
                 failGateway(clientRequest, "Bad Gateway: Unable to connect to target");
             }
-        });
+        }));
     }
 
-    private void upgradeConnectToTunnel(HttpServerRequest clientRequest, DNodeTunnel tunnel) {
-        clientRequest.toNetSocket().onComplete(ar -> {
+    private void upgradeConnectToTunnel(HttpServerRequest clientRequest, DNodeTunnel tunnel, Context ctx,
+                                        Runnable release) {
+        onContext(ctx, () -> clientRequest.toNetSocket().onComplete(ar -> {
             if (ar.failed()) {
                 LOGGER.debug("Failed to upgrade client connection to socket: {}", ar.cause().toString());
                 tunnel.close();
+                release.run();
                 return;
             }
-            pipeSocketAndTunnel(ar.result(), tunnel);
-        });
+            pipeSocketAndTunnel(ar.result(), tunnel, ctx, release);
+        }));
     }
 
     private void handleClientRequest(HttpServerRequest clientRequest) {
@@ -164,32 +225,45 @@ public class HttpProxyVerticle extends AbstractVerticle {
      * 兼容原逻辑：配置了 username 时校验 Proxy-Authorization，失败仍返回 403。
      */
     private boolean authorize(HttpServerRequest clientRequest) {
-        if (!proxyServerConf.containsKey("username") ||
-                StringUtils.isBlank(proxyServerConf.getString("username"))) {
+        String username = proxyServerConf.getString("username");
+        if (StringUtils.isBlank(username)) {
             return true;
         }
-        String s = clientRequest.headers().get("Proxy-Authorization");
-        if (s == null) {
-            clientRequest.response().setStatusCode(403).end();
+        String password = StringUtils.defaultString(proxyServerConf.getString("password"));
+        if (checkBasicAuth(clientRequest.headers().get("Proxy-Authorization"), username, password)) {
+            return true;
+        }
+        LOGGER.info("proxy auth failed from {}",
+                clientRequest.remoteAddress() == null ? "-" : clientRequest.remoteAddress().host());
+        clientRequest.response().setStatusCode(403).end();
+        return false;
+    }
+
+    static boolean checkBasicAuth(String header, String username, String password) {
+        if (header == null) {
             return false;
         }
+        String value = header.trim();
+        if (value.length() < 6 || !value.regionMatches(true, 0, "Basic ", 0, 6)) {
+            return false;
+        }
+        String decoded;
         try {
-            String decoded = new String(Base64.getDecoder().decode(s.replace("Basic ", "")), StandardCharsets.UTF_8);
-            String[] split = decoded.split(":");
-            if (split.length > 1) {
-                String username = proxyServerConf.getString("username");
-                String password = proxyServerConf.getString("password");
-                if (!split[0].equals(username) || !split[1].equals(password)) {
-                    LOGGER.info("-----auth failed------\nusername: {}\npassword: {}", username, password);
-                    clientRequest.response().setStatusCode(403).end();
-                    return false;
-                }
-            }
-        } catch (Exception e) {
-            clientRequest.response().setStatusCode(403).end();
+            decoded = new String(Base64.getDecoder().decode(value.substring(6).trim()), StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException e) {
             return false;
         }
-        return true;
+        int colon = decoded.indexOf(':');
+        if (colon < 0) {
+            return false;
+        }
+        boolean userOk = MessageDigest.isEqual(
+                decoded.substring(0, colon).getBytes(StandardCharsets.UTF_8),
+                username.getBytes(StandardCharsets.UTF_8));
+        boolean passOk = MessageDigest.isEqual(
+                decoded.substring(colon + 1).getBytes(StandardCharsets.UTF_8),
+                password.getBytes(StandardCharsets.UTF_8));
+        return userOk & passOk;
     }
 
     private void handleHttpRequest(HttpServerRequest clientRequest) {
@@ -198,17 +272,41 @@ public class HttpProxyVerticle extends AbstractVerticle {
             clientRequest.response().setStatusCode(400).end("Host header is missing");
             return;
         }
-        clientRequest.pause();
-        if (routeViaDnode(clientRequest, target, false)) {
+        Runnable release = acquire();
+        if (release == null) {
+            rejectBusy(clientRequest);
             return;
         }
-        forwardHttpDirect(clientRequest, target);
+        clientRequest.response().endHandler(v -> release.run());
+        clientRequest.pause();
+        Context ctx = vertx.getOrCreateContext();
+        if (routeViaDnode(clientRequest, target, false, ctx, release)) {
+            return;
+        }
+        forwardHttpDirect(clientRequest, target, release);
+    }
+
+    private void rejectBusy(HttpServerRequest clientRequest) {
+        LOGGER.warn("proxy busy, active={} max={}", ACTIVE.get(), maxConnections);
+        clientRequest.response()
+                .setStatusCode(503)
+                .putHeader(HttpHeaders.CONNECTION, "close")
+                .end("Service Unavailable: too many connections");
+    }
+
+    private static void onContext(Context ctx, Runnable task) {
+        if (Vertx.currentContext() == ctx) {
+            task.run();
+        } else {
+            ctx.runOnContext(v -> task.run());
+        }
     }
 
     /**
      * @return true 表示已接手（走节点或已返回 502），false 表示调用方应本机直连
      */
-    private boolean routeViaDnode(HttpServerRequest clientRequest, HostPort target, boolean connect) {
+    private boolean routeViaDnode(HttpServerRequest clientRequest, HostPort target, boolean connect,
+                                  Context ctx, Runnable release) {
         DNodeServer dnode = DNodeServer.get();
         if (!dnode.isActive()) {
             return false;
@@ -217,15 +315,16 @@ public class HttpProxyVerticle extends AbstractVerticle {
             if (dnode.isFallbackDirect()) {
                 return false;
             }
+            release.run();
             failGateway(clientRequest, "Bad Gateway: Unable to connect to target");
             return true;
         }
         dnode.openTunnel(target.host, target.port, resolveClientIp(clientRequest))
                 .onSuccess(tunnel -> {
                     if (connect) {
-                        upgradeConnectToTunnel(clientRequest, tunnel);
+                        upgradeConnectToTunnel(clientRequest, tunnel, ctx, release);
                     } else {
-                        forwardHttpViaTunnel(clientRequest, target, tunnel);
+                        onContext(ctx, () -> forwardHttpViaTunnel(clientRequest, target, tunnel, release));
                     }
                 })
                 .onFailure(err -> {
@@ -233,18 +332,25 @@ public class HttpProxyVerticle extends AbstractVerticle {
                             target.host, target.port, err.toString());
                     if (dnode.isFallbackDirect()) {
                         if (connect) {
-                            directConnect(clientRequest, target);
+                            directConnect(clientRequest, target, ctx, release);
                         } else {
-                            forwardHttpDirect(clientRequest, target);
+                            onContext(ctx, () -> forwardHttpDirect(clientRequest, target, release));
                         }
                     } else {
-                        failGateway(clientRequest, "Bad Gateway: Unable to connect to target");
+                        onContext(ctx, () -> {
+                            release.run();
+                            failGateway(clientRequest, "Bad Gateway: Unable to connect to target");
+                        });
                     }
                 });
         return true;
     }
 
-    private void forwardHttpDirect(HttpServerRequest clientRequest, HostPort target) {
+    /**
+     * release 除了挂在 response endHandler 上，还要在每个失败出口显式调用：
+     * 客户端 RST 后 Vert.x 4.5.6 只回调 response exceptionHandler，之后 close() 不再触发 endHandler/closeHandler。
+     */
+    private void forwardHttpDirect(HttpServerRequest clientRequest, HostPort target, Runnable release) {
         HttpServerResponse clientResp = clientRequest.response();
         RequestOptions options = new RequestOptions()
                 .setMethod(clientRequest.method())
@@ -261,10 +367,15 @@ public class HttpProxyVerticle extends AbstractVerticle {
                             && mayHaveBody(clientRequest.method())) {
                         upstream.setChunked(true);
                     }
+                    clientResp.closeHandler(v -> {
+                        upstream.reset();
+                        release.run();
+                    });
                     upstream.response()
                             .onSuccess(upstreamResp -> {
                                 if (clientResp.ended() || clientResp.closed()) {
                                     upstreamResp.request().connection().close();
+                                    release.run();
                                     return;
                                 }
                                 clientResp.setStatusCode(upstreamResp.statusCode());
@@ -275,37 +386,95 @@ public class HttpProxyVerticle extends AbstractVerticle {
                                 if (upstreamResp.getHeader(HttpHeaders.CONTENT_LENGTH) == null) {
                                     clientResp.setChunked(true);
                                 }
-                                upstreamResp.exceptionHandler(err -> {
-                                    LOGGER.debug("upstream response error: {}", err.toString());
+                                relay(upstreamResp, clientResp).onFailure(err -> {
+                                    LOGGER.debug("relay response failed: {}", err.toString());
+                                    upstream.reset();
                                     safeClose(clientResp);
-                                });
-                                upstreamResp.pipeTo(clientResp).onFailure(err -> {
-                                    LOGGER.debug("pipe response failed: {}", err.toString());
-                                    safeClose(clientResp);
+                                    release.run();
                                 });
                             })
                             .onFailure(err -> {
                                 LOGGER.debug("upstream response failed: {}", err.toString());
                                 failGateway(clientRequest, "Bad Gateway: Unable to reach target");
+                                release.run();
                             });
 
-                    clientRequest.exceptionHandler(err -> {
-                        LOGGER.debug("client request error: {}", err.toString());
-                        upstream.reset();
-                    });
-                    clientRequest.pipeTo(upstream).onFailure(err -> {
-                        LOGGER.debug("pipe request failed: {}", err.toString());
+                    if (isExpectContinue(clientRequest)) {
+                        // 等上游决定是否接收正文，再把 100 转给客户端
+                        upstream.continueHandler(v -> {
+                            if (!clientResp.headWritten() && !clientResp.closed()) {
+                                clientResp.writeContinue();
+                            }
+                        });
+                        upstream.sendHead();
+                    }
+                    relay(clientRequest, upstream).onFailure(err -> {
+                        LOGGER.debug("relay request failed: {}", err.toString());
                         upstream.reset();
                         failGateway(clientRequest, "Bad Gateway: Unable to reach target");
+                        release.run();
                     });
                 })
                 .onFailure(err -> {
                     LOGGER.warn("Failed to send proxy request: {}", err.toString());
                     failGateway(clientRequest, "Bad Gateway: Request failed");
+                    release.run();
                 });
     }
 
-    private void forwardHttpViaTunnel(HttpServerRequest clientRequest, HostPort target, DNodeTunnel tunnel) {
+    /**
+     * 带背压的单向转发，替代 ReadStream.pipeTo：目标流被对端 reset/关闭后，
+     * PipeImpl 会在同一回调里对已结束的流调用 writeQueueFull() 并抛出 IllegalStateException。
+     * 这里对每次写做保护，失败只上报一次，并把剩余数据丢弃。
+     */
+    static Future<Void> relay(ReadStream<Buffer> src, WriteStream<Buffer> dst) {
+        Promise<Void> done = Promise.promise();
+        src.pause();
+        src.handler(buf -> {
+            if (done.future().isComplete()) {
+                return;
+            }
+            try {
+                dst.write(buf).onFailure(done::tryFail);
+                if (dst.writeQueueFull()) {
+                    src.pause();
+                    dst.drainHandler(v -> src.resume());
+                }
+            } catch (IllegalStateException e) {
+                done.tryFail(e);
+            }
+        });
+        src.endHandler(v -> {
+            if (done.future().isComplete()) {
+                return;
+            }
+            try {
+                dst.end().onComplete(done);
+            } catch (IllegalStateException e) {
+                done.tryFail(e);
+            }
+        });
+        src.exceptionHandler(done::tryFail);
+        dst.exceptionHandler(done::tryFail);
+        done.future().onFailure(err -> {
+            try {
+                src.handler(null);
+                src.resume();
+            } catch (IllegalStateException ignored) {
+                // 源流已结束
+            }
+        });
+        src.resume();
+        return done.future();
+    }
+
+    private static boolean isExpectContinue(HttpServerRequest req) {
+        String expect = req.getHeader(HttpHeaders.EXPECT);
+        return expect != null && "100-continue".equalsIgnoreCase(expect.trim());
+    }
+
+    private void forwardHttpViaTunnel(HttpServerRequest clientRequest, HostPort target, DNodeTunnel tunnel,
+                                      Runnable release) {
         HttpServerResponse clientResp = clientRequest.response();
         try {
             tunnel.write(buildHttpRequestHead(clientRequest, target));
@@ -317,7 +486,12 @@ public class HttpProxyVerticle extends AbstractVerticle {
         Context ctx = vertx.getOrCreateContext();
         HttpResponseBridge bridge = new HttpResponseBridge(clientResp, tunnel);
         tunnel.handler(buf -> ctx.runOnContext(v -> bridge.accept(buf)));
-        tunnel.closeHandler(v -> ctx.runOnContext(x -> bridge.onTunnelClose()));
+        tunnel.closeHandler(v -> ctx.runOnContext(x -> {
+            bridge.onTunnelClose();
+            release.run();
+        }));
+        clientResp.closeHandler(v -> tunnel.close());
+        clientResp.exceptionHandler(err -> tunnel.close());
         clientRequest.handler(tunnel::write);
         clientRequest.exceptionHandler(err -> tunnel.close());
         clientRequest.resume();
@@ -350,12 +524,20 @@ public class HttpProxyVerticle extends AbstractVerticle {
         return Buffer.buffer(sb.toString(), StandardCharsets.UTF_8.name());
     }
 
-    private void pipeSockets(NetSocket a, NetSocket b) {
-        pump(a, b);
-        pump(b, a);
+    private void pipeSockets(NetSocket client, NetSocket target, Runnable release) {
+        AtomicBoolean closed = new AtomicBoolean();
+        Runnable closeBoth = () -> {
+            if (closed.compareAndSet(false, true)) {
+                client.close();
+                target.close();
+                release.run();
+            }
+        };
+        pump(client, target, closeBoth);
+        pump(target, client, closeBoth);
     }
 
-    private void pump(NetSocket from, NetSocket to) {
+    private static void pump(NetSocket from, NetSocket to, Runnable closeBoth) {
         from.handler(data -> {
             to.write(data);
             if (to.writeQueueFull()) {
@@ -363,31 +545,24 @@ public class HttpProxyVerticle extends AbstractVerticle {
                 to.drainHandler(v -> from.resume());
             }
         });
-        from.closeHandler(v -> to.close());
-        from.exceptionHandler(e -> to.close());
+        // closeHandler 在对端断开时立即触发，此时暂停中的 from 可能还有未投递的数据；
+        // endHandler 在缓冲数据全部交给 handler 之后才触发
+        from.endHandler(v -> closeBoth.run());
+        from.exceptionHandler(e -> closeBoth.run());
     }
 
-    private void pipeSocketAndTunnel(NetSocket client, DNodeTunnel tunnel) {
-        Context ctx = vertx.getOrCreateContext();
-        client.handler(buf -> {
-            tunnel.write(buf);
-            if (client.writeQueueFull()) {
-                client.pause();
-                client.drainHandler(v -> client.resume());
-            }
+    private void pipeSocketAndTunnel(NetSocket client, DNodeTunnel tunnel, Context ctx, Runnable release) {
+        client.handler(tunnel::write);
+        client.closeHandler(v -> {
+            tunnel.close();
+            release.run();
         });
-        client.closeHandler(v -> tunnel.close());
-        client.exceptionHandler(e -> tunnel.close());
-        tunnel.handler(buf -> ctx.runOnContext(v -> {
-            if (!client.writeQueueFull()) {
-                client.write(buf);
-            } else {
-                client.write(buf);
-                client.pause();
-                client.drainHandler(x -> client.resume());
-            }
+        client.exceptionHandler(e -> client.close());
+        tunnel.handler(buf -> ctx.runOnContext(v -> client.write(buf)));
+        tunnel.closeHandler(v -> ctx.runOnContext(x -> {
+            client.close();
+            release.run();
         }));
-        tunnel.closeHandler(v -> ctx.runOnContext(x -> client.close()));
     }
 
     private void copyRequestHeaders(HttpServerRequest from, io.vertx.core.MultiMap to) {
@@ -421,7 +596,11 @@ public class HttpProxyVerticle extends AbstractVerticle {
             resp.close();
             return;
         }
-        resp.setStatusCode(502).end(msg);
+        // 关闭连接，否则 Vert.x 会继续读完并丢弃客户端剩余的请求体
+        resp.setStatusCode(502)
+                .putHeader(HttpHeaders.CONNECTION, "close")
+                .end(msg)
+                .onComplete(v -> req.connection().close());
     }
 
     private static void safeClose(HttpServerResponse resp) {

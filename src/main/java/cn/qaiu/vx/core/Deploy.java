@@ -125,7 +125,8 @@ public final class Deploy {
             // 部署 路由、异步service、反向代理 服务
             // 生成随机密码
             JsonObject jsonObject = ((JsonObject) localMap.get(GLOBAL_CONFIG)).getJsonObject("proxy-server");
-            if (jsonObject.getBoolean("randUserPwd")) {
+            boolean randomCredentials = jsonObject.getBoolean("randUserPwd", false);
+            if (randomCredentials) {
                 var username = UUID.randomUUID().toString().replace("-", "").substring(0, 16);
                 var password = UUID.randomUUID().toString().replace("-", "").substring(0, 16);
                 jsonObject.put("username", username);
@@ -135,7 +136,11 @@ public final class Deploy {
             LOGGER.info("\nport: {}\nusername: {}\npassword: {}",
                     jsonObject.getString("port"),
                     jsonObject.getString("username"),
-                    jsonObject.getString("password"));
+                    maskPassword(jsonObject.getString("password")));
+            if (randomCredentials) {
+                // 随机口令只打印到控制台，不进入日志文件
+                System.out.println("random proxy password: " + jsonObject.getString("password"));
+            }
             JsonObject dnodeServer = globalConfig.getJsonObject("dnode-server");
             JsonObject dnodeClient = globalConfig.getJsonObject("dnode-client");
             boolean ds = dnodeServer != null && Boolean.TRUE.equals(dnodeServer.getBoolean("enabled"));
@@ -163,10 +168,24 @@ public final class Deploy {
     }
 
     private DeploymentOptions getWorkDeploymentOptions(String name, int ins) {
+        return proxyDeploymentOptions(ins);
+    }
+
+    /**
+     * 代理必须跑在 event loop 上：CONNECT 隧道两端的 NetSocket 若分属 event loop 与 worker 线程，
+     * Vert.x 内部的 synchronized 会出现锁顺序反转（大上传时 drainHandler 触发），导致隧道死锁。
+     */
+    public static DeploymentOptions proxyDeploymentOptions(int instances) {
         return new DeploymentOptions()
-                .setWorkerPoolName(name)
-                .setThreadingModel(ThreadingModel.WORKER)
-                .setInstances(ins);
+                .setThreadingModel(ThreadingModel.EVENT_LOOP)
+                .setInstances(Math.max(1, instances));
+    }
+
+    static String maskPassword(String password) {
+        if (password == null || password.isEmpty()) {
+            return "(none)";
+        }
+        return "******";
     }
 
 
