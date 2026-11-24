@@ -89,6 +89,17 @@
             <resource>
                 <directory>src/main/resources</directory>
                 <filtering>true</filtering>
+                <excludes>
+                    <!-- Node 程序含 ${} 模板字符串，过滤会改写源码 -->
+                    <exclude>upload-relay/**</exclude>
+                </excludes>
+            </resource>
+            <resource>
+                <directory>src/main/resources</directory>
+                <filtering>false</filtering>
+                <includes>
+                    <include>upload-relay/**</include>
+                </includes>
             </resource>
         </resources>
         <plugins>

@@ -184,7 +184,14 @@ dnode-client:
 
 心跳为 WebSocket **文本** JSON：`{"type":"ping"}` / `{"type":"pong"}`。
 
+## 网盘上传中转
+
+独立的 Node.js 服务，不由本进程的 Vert.x 代理执行。当前提供蓝奏云流式上传中转和浏览器直连测速，协议与 nfd-vip 后台模式 2 一致。nfd-vip 闭源，因此中转程序在本仓库开源维护，后续可扩展为通用网盘中转。
+
+部署、反代与接口说明：[src/main/resources/upload-relay/README.md](src/main/resources/upload-relay/README.md)。
+
 ## 其它资源
 
+- `src/main/resources/upload-relay/`：网盘上传中转（蓝奏云流式上传与浏览器测速），见 [README](src/main/resources/upload-relay/README.md)
 - `src/main/resources/tampermonkey/`：油猴脚本（如 vConsole）
 - `src/main/resources/edge/`：123 网盘 EdgeOne 边缘函数示例（JSON 解析 / 纯 302）
